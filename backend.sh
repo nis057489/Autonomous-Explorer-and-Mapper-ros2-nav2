@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Backend bringup for distributed Nav2 + SLAM Toolbox + custom_explorer.
-# - Binds CycloneDDS to the WireGuard interface (wg0 by default)
-# - Starts SLAM Toolbox
-# - Starts Nav2
-# - Starts the custom explorer node (from Autonomous-Explorer-and-Mapper-ros2-nav2)
-# - Optionally starts RViz for visualization.
+# Backend bringup for distributed Nav2 + SLAM Toolbox + custom_explorer using Zenoh (rmw_zenoh_cpp).
+# - Connects backend ROS 2 nodes as Zenoh clients to the robot's Zenoh router.
+# - Starts SLAM Toolbox, Nav2, custom_explorer, and optionally RViz.
+#
+# Prereqs on this machine:
+#   sudo apt install ros-humble-rmw-zenoh-cpp
 #
 # Edit the CONFIG section to match your system.
 
@@ -13,17 +13,17 @@ set -e
 
 ########## CONFIG ##########
 
-# WireGuard network interface name
-WG_IF="wg0"
-
 # Shared ROS 2 domain ID (must match robot)
 ROS_DOMAIN_ID_VALUE="42"
 
-# Path to your ROS 2 workspace (containing Autonomous-Explorer-and-Mapper-ros2-nav2)
+# Path to your ROS 2 workspace (containing Autonomous-Explorer-and-Mapper-ros2-nav2 etc.)
 ROS_WS="$HOME/ros2_ws"
 
-# CycloneDDS config file location (per-user, no sudo needed)
-CYCLONEDDS_CONFIG_FILE="$HOME/.config/cyclonedds_backend.xml"
+# WireGuard / VPN IP of the robot machine, where the Zenoh router is running
+ROBOT_WG_IP="192.168.100.21"
+
+# Port where rmw_zenohd listens (default 7447 in the default router config) :contentReference[oaicite:6]{index=6}
+ROBOT_ZENOH_PORT="7447"
 
 # Nav2 params file for your real robot.
 # Set this to your tuned nav2_params.yaml, or leave empty to use Nav2 defaults.
@@ -34,43 +34,26 @@ RUN_RVIZ="true"
 
 ######## END CONFIG ########
 
-echo "[backend] Using WireGuard interface: $WG_IF"
+ROBOT_ENDPOINT="tcp/${ROBOT_WG_IP}:${ROBOT_ZENOH_PORT}"
+
 echo "[backend] ROS_DOMAIN_ID: $ROS_DOMAIN_ID_VALUE"
 echo "[backend] ROS workspace: $ROS_WS"
-echo "[backend] CycloneDDS config: $CYCLONEDDS_CONFIG_FILE"
+echo "[backend] Robot Zenoh endpoint: $ROBOT_ENDPOINT"
 [ -n "$NAV2_PARAMS_FILE" ] && echo "[backend] Using Nav2 params file: $NAV2_PARAMS_FILE"
+echo "[backend] Using rmw_zenoh_cpp as middleware."
 
-# Ensure config dir exists
-mkdir -p "$(dirname "$CYCLONEDDS_CONFIG_FILE")"
-
-# Create CycloneDDS config bound to the WireGuard interface
-cat > "$CYCLONEDDS_CONFIG_FILE" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<CycloneDDS>
-  <Domain id="any">
-    <General>
-      <!-- Bind DDS to the WireGuard interface -->
-      <NetworkInterfaceAddress>${WG_IF}</NetworkInterfaceAddress>
-      <!-- Usually good over VPNs -->
-      <AllowMulticast>false</AllowMulticast>
-    </General>
-  </Domain>
-</CycloneDDS>
-EOF
-
-export CYCLONEDDS_URI="file://$CYCLONEDDS_CONFIG_FILE"
-export RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
+export RMW_IMPLEMENTATION="rmw_zenoh_cpp"
 export ROS_DOMAIN_ID="$ROS_DOMAIN_ID_VALUE"
 export ROS_LOCALHOST_ONLY=0
 
-# Basic checks
-if ! ip link show "$WG_IF" > /dev/null 2>&1; then
-  echo "[backend][WARN] Interface $WG_IF not found. Is WireGuard up?"
-fi
+# Configure all ROS 2 nodes started from this script to:
+#   - act as Zenoh CLIENTS
+#   - connect directly to the robot's Zenoh router over TCP
+# Based on rmw_zenoh session config examples (mode=client + connect/endpoints). :contentReference[oaicite:7]{index=7}
+export ZENOH_CONFIG_OVERRIDE="mode=\"client\";connect/endpoints=[\"${ROBOT_ENDPOINT}\"]"
 
 if [ ! -d "$ROS_WS" ]; then
-  echo "[backend][ERROR] ROS workspace '$ROS_WS' not found. Edit ROS_WS in this script."
-  exit 1
+  echo "[backend][WARN] ROS workspace '$ROS_WS' not found. Edit ROS_WS in this script if needed."
 fi
 
 # Source ROS and workspace
@@ -89,7 +72,6 @@ else
   echo "[backend][WARN] $ROS_WS/install/setup.bash not found. Did you run 'colcon build'?"
 fi
 
-# Helper to run long-lived nodes in background and remember PIDs
 PIDS=()
 
 start_bg() {
@@ -109,34 +91,32 @@ cleanup() {
   wait || true
   echo "[backend] Shutdown complete."
 }
-
 trap cleanup INT TERM
 
 ########## START NODES ##########
 
-# 1. SLAM Toolbox (online asynchronous mapping) :contentReference[oaicite:1]{index=1}
+# 1. SLAM Toolbox (online asynchronous mapping)
 start_bg "ros2 launch slam_toolbox online_async_launch.py"
 
-# 2. Nav2 bringup (using params file if provided) :contentReference[oaicite:2]{index=2}
+# 2. Nav2 bringup (using params file if provided)
 NAV2_CMD="ros2 launch nav2_bringup navigation_launch.py use_sim_time:=false"
-if [ -n "$NAV2_PARAMS_FILE" ]; then
-  NAV2_CMD="$NAV2_CMD params_file:=$NAV2_PARAMS_FILE"
+if [ -n \"$NAV2_PARAMS_FILE\" ]; then
+  NAV2_CMD=\"\$NAV2_CMD params_file:=$NAV2_PARAMS_FILE\"
 fi
 start_bg "$NAV2_CMD"
 
-# 3. Custom explorer node from Autonomous-Explorer-and-Mapper-ros2-nav2 :contentReference[oaicite:3]{index=3}
-#    This expects that you've cloned and built the repo in $ROS_WS/src
+# 3. Custom explorer node from Autonomous-Explorer-and-Mapper-ros2-nav2
+#    (assumes the package 'custom_explorer' is built in $ROS_WS)
 start_bg "ros2 run custom_explorer explorer"
 
-# 4. RViz for visualization (optional, can be disabled via RUN_RVIZ=false) :contentReference[oaicite:4]{index=4}
-if [ "$RUN_RVIZ" = "true" ]; then
-  start_bg "ros2 launch nav2_bringup rviz_launch.py"
+# 4. RViz for visualization (optional)
+if [ \"$RUN_RVIZ\" = \"true\" ]; then
+  start_bg \"ros2 launch nav2_bringup rviz_launch.py\"
 fi
 
 echo "[backend] All backend nodes started."
 echo "[backend] PIDs: ${PIDS[*]}"
 echo "[backend] Press Ctrl+C to stop everything."
 
-# Wait for all children
 wait
 echo "[backend] All backend processes exited."
